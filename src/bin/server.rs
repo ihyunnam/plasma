@@ -83,7 +83,7 @@ impl Collector for BatchCollectorServer {
         "Done".to_string()
     }
 
-    async fn tree_crawl(self, _: context::Context, req: TreeCrawlRequest) -> Vec<u64> {
+    async fn 1(self, _: context::Context, req: TreeCrawlRequest) -> Vec<u64> {
         let client_idx = req.client_idx as usize;
         let split_by = req.split_by;
         let malicious = req.malicious;

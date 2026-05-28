@@ -38,10 +38,10 @@ zipf = "7.0.0"
 counttree = { git = "https://github.com/ihyunnam/heavyhitters.git", rev = "565a544c150048b63ebea48c6711a210be911bdd" }
 
 
-[[bin]]
-name = "server"
-path = "src/bin/server.rs"
+#[[bin]]
+#name = "server"
+#path = "src/bin/server.rs"
 
-[[bin]]
-name = "leader"
-path = "src/bin/leader.rs"
+#[[bin]]
+#name = "leader"
+#path = "src/bin/leader.rs"
