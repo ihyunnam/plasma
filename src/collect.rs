@@ -305,6 +305,10 @@ impl GlimpseKeyCollection {
             .collect::<Vec<EmbCnt>>()
     }
 
+    pub fn get_mtree_roots_size(&self) -> usize {
+        self.mtree_roots.len()
+    }
+
     pub fn get_merkle_roots(
         &self,
         start: usize,
