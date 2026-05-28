@@ -7,6 +7,18 @@ use blake3::Hasher;
 use serde::Deserialize;
 use serde::Serialize;
 
+// Reused from counttree for the sketch path. The field arithmetic and the
+// 2-round MPC sketch (`SketchOutput`, Beaver `TripleShare`) are identical to
+// counttree's; only the *key* (and its proof-carrying eval) is plasma-native.
+// counttree's `Group`/`Share`/`FromRng` are aliased so they don't collide with
+// plasma's `Group` (already imported above): `FE` only implements counttree's,
+// so `FE` field ops resolve unambiguously to these.
+use counttree::fastfield::FE;
+use counttree::mpc::TripleShare;
+use counttree::sketch::{EmbCnt, SketchOutput, TRIPLES_PER_LEVEL};
+use counttree::Group as CtGroup;
+use counttree::Share as CtShare;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CorWord<T> {
     seed: prg::PrgSeed,
@@ -145,7 +157,7 @@ where
     T: prg::FromRng + Clone + Group + std::fmt::Debug,
 {
     pub fn gen(alpha_bits: &[bool], values: &[T]) -> (DPFKey<T>, DPFKey<T>) {
-        debug_assert!(alpha_bits.len() == values.len() + 1);
+        debug_assert!(alpha_bits.len() == values.len());
 
         let root_seeds = (prg::PrgSeed::random(), prg::PrgSeed::random());
         let root_bits = (false, true);
@@ -220,7 +232,7 @@ where
             word.negate()
         }
 
-        // Compute proofs
+        // Compute Plasma proofs
         let h2 = {
             let mut hasher = Hasher::new();
             hasher.update_rayon(bit_str.as_bytes());
@@ -294,5 +306,143 @@ where
 
     pub fn domain_size(&self) -> usize {
         self.cor_words.len()
+    }
+}
+
+/// Rejection-sample a uniform `FE` from plasma's RNG (`rand` 0.8) via `FE`'s
+/// public unbiased constructor. This deliberately avoids counttree's
+/// `prg::FromRng` for `FE` (bound to `rand_core` 0.5), so plasma's `PrgStream`
+/// (`rand_core` 0.6) can drive the sketch r-stream without a version clash.
+#[inline]
+fn fe_from_rng(rng: &mut impl rand::Rng) -> FE {
+    loop {
+        if let Some(x) = FE::from_u64_unbiased(rng.gen::<u64>()) {
+            return x;
+        }
+    }
+}
+
+/// Poplar malicious-secure sketch DPF key built on plasma's **proof-carrying** VIDPF
+/// (`DPFKey`, whose `EvalState` carries the `.proof` that `GlimpseKeyCollection`'s
+/// Merkle tree consumes). DPFKey payload is hardcoded to `(EmbCnt, EmbCnt) = (x, kx)` of Poplar encoding, 
+/// and the Poplar 0/1 sketching + MAC checks run over FE.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SketchDPFKey {
+    pub mac_key: FE,
+    pub mac_key2: FE,
+    key: DPFKey<(EmbCnt, EmbCnt)>, // the payload is (x,kx)
+    pub triples: Vec<TripleShare<FE>>,
+}
+
+impl SketchDPFKey {
+    #[allow(clippy::needless_range_loop)]
+    pub fn gen(alpha_bits: &[bool], values_in: &[EmbCnt]) -> [SketchDPFKey; 2] {
+        debug_assert!(alpha_bits.len() == values_in.len());
+        // For MAC key κ, encode each level's value x as the pair (x, κ·x). The
+        // MAC lives in the `count` field; the encoding's embedding is unused.
+        let mac_key = FE::random();
+        let (mac_key_sh0, mac_key_sh1) = mac_key.share();
+        let mut mac_key2 = mac_key.clone();
+        mac_key2.mul(&mac_key);
+        let (mac_key2_sh0, mac_key2_sh1) = mac_key2.share();
+
+        let mut values: Vec<(EmbCnt, EmbCnt)> = Vec::with_capacity(alpha_bits.len());
+        for i in 0..alpha_bits.len() {
+            let mut mac_val = values_in[i].count.clone();
+            mac_val.mul(&mac_key);
+            let payload = values_in[i].clone();
+            let encoding = EmbCnt { count: mac_val, embedding: vec![0u32] }; // unused
+            values.push((payload, encoding));
+        }
+
+        let (dpf_key0, dpf_key1) = DPFKey::gen(alpha_bits, &values);
+
+        // Beaver triples: TRIPLES_PER_LEVEL multiplications per level (sketch
+        // check z^2 - z* = 0, plus two for the MAC).
+        let mut triples0: Vec<TripleShare<FE>> = vec![];
+        let mut triples1: Vec<TripleShare<FE>> = vec![];
+        for _ in 0..TRIPLES_PER_LEVEL * alpha_bits.len() {
+            let t = TripleShare::new();
+            triples0.push(t[0].clone());
+            triples1.push(t[1].clone());
+        }
+
+        [
+            SketchDPFKey {
+                mac_key: mac_key_sh0,
+                mac_key2: mac_key2_sh0,
+                key: dpf_key0,
+                triples: triples0,
+            },
+            SketchDPFKey {
+                mac_key: mac_key_sh1,
+                mac_key2: mac_key2_sh1,
+                key: dpf_key1,
+                triples: triples1,
+            },
+        ]
+    }
+
+    /// Per-level 0/1 + MAC sketch over the `FE` count pairs `(⟨r,x⟩, ⟨r,κ·x⟩)`.
+    /// Identical math to counttree's; the r-stream is sampled from plasma's RNG.
+    pub fn sketch_at(
+        &self,
+        vector_in: &[(FE, FE)],
+        rand_stream: &mut impl rand::Rng,
+    ) -> SketchOutput<FE> {
+        let mut out: SketchOutput<FE> = SketchOutput::zero();
+
+        out.rand1 = fe_from_rng(rand_stream);
+        out.rand2 = fe_from_rng(rand_stream);
+        out.rand3 = fe_from_rng(rand_stream);
+
+        for v in vector_in {
+            let sketch_r = fe_from_rng(rand_stream);
+            let mut sketch_r2 = sketch_r;
+            sketch_r2.mul_lazy(&sketch_r);
+
+            let (x, kx) = v;
+
+            let mut tmp0 = *x;
+            tmp0.mul_lazy(&sketch_r);
+            let mut tmp1 = *x;
+            tmp1.mul_lazy(&sketch_r2);
+            let mut tmp2 = *kx;
+            tmp2.mul_lazy(&sketch_r);
+
+            out.r_x.add_lazy(&tmp0);
+            out.r2_x.add_lazy(&tmp1);
+            out.r_kx.add_lazy(&tmp2);
+        }
+
+        out.reduce();
+        out
+    }
+
+    pub fn eval_init(&self) -> EvalState {
+        self.key.eval_init()
+    }
+
+    /// Proof-carrying per-bit eval. Returns the new state (with updated
+    /// `.proof`) and the `(x, κ·x)` pair at this node.
+    pub fn eval_bit(
+        &self,
+        state: &EvalState,
+        dir: bool,
+        bit_str: &String,
+    ) -> (EvalState, EmbCnt, EmbCnt) {
+        let (st, val) = self.key.eval_bit(state, dir, bit_str);
+        (st, val.0, val.1)
+    }
+
+    /// Full path eval, threading the proof through `pi`. Returns the leaf
+    /// `(x, κ·x)` pair.
+    pub fn eval(&self, idx: &[bool], pi: &mut [u8; XOF_SIZE]) -> (EmbCnt, EmbCnt) {
+        let (_vals, last) = self.key.eval(idx, pi);
+        (last.0, last.1)
+    }
+
+    pub fn domain_size(&self) -> usize {
+        self.key.domain_size()
     }
 }
