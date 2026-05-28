@@ -1,5 +1,6 @@
 [package]
 name = "plasma"
+autobins = false
 description = "PLASMA: Private, Lightweight Aggregated Statistics against Malicious Adversaries with Full Security"
 version = "0.1.0"
 edition = "2021"
