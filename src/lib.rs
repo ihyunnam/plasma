@@ -3,6 +3,7 @@ pub mod collect;
 pub mod config;
 pub mod consts;
 pub mod dpf;
+pub mod emb_cnt;
 mod field;
 pub mod prg;
 pub mod rpc;
@@ -24,6 +25,10 @@ use rayon::prelude::*;
 
 pub use crate::rpc::CollectorClient as HHCollectorClient;
 
+// Re-export so downstream (server/src/lib.rs::traverse_tree_vidpf) can decide the
+// per-session count-exchange direction without reaching into `collect`.
+pub use crate::collect::is_server_zero_in_session;
+
 // Additive group, such as (Z_n, +)
 pub trait Group {
     fn zero() -> Self;
@@ -32,6 +37,13 @@ pub trait Group {
     fn add(&mut self, other: &Self);
     fn sub(&mut self, other: &Self);
     fn value(self) -> u64;
+    /// Free embedding payload for when only count payload is needed
+    fn clear_aux(&mut self) {}
+    fn add_lazy(&mut self, other: &Self) {
+        self.add(other);
+    }
+    /// FE explicit reduction
+    fn reduce(&mut self) {}
 }
 
 pub trait Share: Group + prg::FromRng + Clone {
