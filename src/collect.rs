@@ -219,14 +219,6 @@ impl GlimpseKeyCollection {
             self.frontier = self.prev_frontier.clone();
         }
 
-        // let level = if self.frontier.is_empty() {
-        //     0
-        // } else {
-        //     self.frontier[0].path.len()
-        // };
-        // debug_assert!(level < self.depth);
-        // println!("Level {}", level);
-
         let next_frontier = self
             .frontier
             .par_iter()
@@ -267,7 +259,6 @@ impl GlimpseKeyCollection {
         let chunk_sz = num_leaves / split_by;
         let chunks_list = combined_hashes.chunks(chunk_sz).collect::<Vec<_>>();
 
-        // if (self.server_id == 0 && session_idx == 2) || (self.server_id == 2 && session_idx == 0) {
         // Compute a merkle tree; each leaf is each client's collapsed proof.
         // Note: root check is VIDPF proofs at that level collapsed into one hash equality check.
         self.mtree_roots = vec![];
@@ -293,7 +284,6 @@ impl GlimpseKeyCollection {
                 self.mtree_indices.push(i * 2 + 1);
             }
         }
-        // }
 
         self.prev_frontier = self.frontier.clone();
         self.frontier = next_frontier;
@@ -301,7 +291,7 @@ impl GlimpseKeyCollection {
         // Summed evaluations (COUNT ONLY) for different 'child' prefixes
         self.frontier
             .par_iter()
-            .map(|node| node.value.clone()) // TODO sum of paylods but embedding wiped out with clear_aux() ?!??!1
+            .map(|node| node.value.clone()) // TODO sum of paylods but embedding wiped out with clear_aux()
             .collect::<Vec<EmbCnt>>()
     }
 
@@ -334,17 +324,10 @@ impl GlimpseKeyCollection {
         &mut self,
         start: usize,
         end: usize,
-    ) -> (Vec<SketchOutput<FE>>, Vec<Vec<(FE, FE)>>) {
-        // println!("Sketching frontier {:?} to {:?}", start, end);
-        // sketch_vectors[i][j] = { j'th value expanded from i'th key }
-
+    ) -> Vec<SketchOutput<FE>> {
         assert!(start < end);
         assert!(end <= self.keys.len());
 
-        // Transpose node-major -> key-major in parallel: each key's sketch
-        // vector is independent, so build them across rayon workers instead of
-        // the O(frontier_len * n_keys) sequential nested loop. Result order is
-        // identical (sketch_vectors[i] is for key start+i).
         let sketch_vectors: Vec<Vec<(FE, FE)>> = (start..end)
             .into_par_iter()
             .map(|i| {
@@ -367,7 +350,7 @@ impl GlimpseKeyCollection {
 
         // println!("... Done");
 
-        (out, sketch_vectors)
+        out
     }
 
     pub fn apply_sketch_results(&mut self, res: &[bool]) {
