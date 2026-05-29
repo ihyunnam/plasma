@@ -19,16 +19,6 @@ use counttree::sketch::{EmbCnt, SketchOutput, TRIPLES_PER_LEVEL};
 use counttree::Group as CtGroup;
 use counttree::Share as CtShare;
 
-// Per-phase timing for DPFKey::eval_bit, accumulated across the rayon par_iter in
-// collect::tree_crawl and reported (then reset) there once per crawl. Sums overlap
-// across threads, so treat these as relative CPU-time, not wall-clock. NOTE: for the
-// cheap `expand` phase the Instant::now() + atomic-add overhead itself inflates the
-// number; the meaningful comparison is convert vs proof.
-pub(crate) static EB_EXPAND_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static EB_CONVERT_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static EB_WORD_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static EB_PROOF_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CorWord<T> {
     seed: prg::PrgSeed,
@@ -221,8 +211,6 @@ where
     }
 
     pub fn eval_bit(&self, state: &EvalState, dir: bool, bit_str: &String) -> (EvalState, T) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let t0 = std::time::Instant::now();
         let tau = state.seed.expand_dir(!dir, dir);
         let mut seed = tau.seeds.get(dir).clone();
         let mut new_bit = *tau.bits.get(dir);
@@ -231,11 +219,9 @@ where
             seed = &seed ^ &self.cor_words[state.level].seed;
             new_bit ^= self.cor_words[state.level].bits.get(dir);
         }
-        let t1 = std::time::Instant::now();
 
         let converted = seed.convert::<T>();
         let new_seed = converted.seed;
-        let t2 = std::time::Instant::now();
 
         let mut word = converted.word;
         if new_bit {
@@ -245,7 +231,6 @@ where
         if self.key_idx {
             word.negate()
         }
-        let t3 = std::time::Instant::now();
 
         // Compute Plasma proofs
         let h2 = {
@@ -269,12 +254,6 @@ where
             .as_slice()
             .try_into()
             .unwrap();
-        let t4 = std::time::Instant::now();
-
-        EB_EXPAND_NANOS.fetch_add(t1.duration_since(t0).as_nanos() as u64, Relaxed);
-        EB_CONVERT_NANOS.fetch_add(t2.duration_since(t1).as_nanos() as u64, Relaxed);
-        EB_WORD_NANOS.fetch_add(t3.duration_since(t2).as_nanos() as u64, Relaxed);
-        EB_PROOF_NANOS.fetch_add(t4.duration_since(t3).as_nanos() as u64, Relaxed);
 
         (
             EvalState {
