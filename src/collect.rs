@@ -358,40 +358,14 @@ impl GlimpseKeyCollection {
 
         // Remove invalid keys
         for (i, alive) in res.iter().enumerate() {
-            if !alive { *poplar_disabled_this_level = false; }
+            if !alive { *poplar_disabled_this_level = true; }
             self.keys[i].0 &= alive;
         }
     }
 
     /// Correct the already-crawled frontier node values (count *and* embedding) by
-    /// subtracting the full payload of the clients that failed the sketch — without
-    /// a full re-crawl. Only the failed clients are re-evaluated (replayed from
-    /// `prev_frontier`), so the cost scales with the number of failures, not `n_keys`.
-    ///
-    /// `tree_crawl` aggregated each node's value over every key live at crawl time,
-    /// including clients that then failed the sketch (the VIDPF check only constrains
-    /// the *path*, not that `count == 1`, so their count/embedding can be arbitrary).
-    /// `clear_aux` freed the per-client embedding shares, so the contributions can't
-    /// be subtracted from storage — they are recomputed here by re-running `eval_bit`
-    /// for the failed clients against the parent states.
-    ///
-    /// Read-only: this does **not** drop the failed keys — call `apply_sketch_results`
-    /// for that. It must run *before* `apply_sketch_results`, since it identifies the
-    /// failed clients as those still live (`keys[i].0`) but masked out by `alive`.
-    ///
-    /// Precondition: must be called on the frontier produced by the immediately
-    /// preceding `tree_crawl`, i.e. `prev_frontier` holds that crawl's parents and
-    /// `frontier` its children (ordered `[p0c0, p0c1, p1c0, p1c1, ...]`).
-    pub fn subtract_failed_from_frontier(&self, alive: &[bool]) -> Vec<EmbCnt> {
-        assert_eq!(alive.len(), self.keys.len());
-
-        // Clients that contributed to this frontier (still live, i.e. live at crawl
-        // time) but just failed the sketch — the contributions to back out. Must be
-        // computed before `apply_sketch_results` clears these flags.
-        let failed: Vec<usize> = (0..self.keys.len())
-            .filter(|&i| self.keys[i].0 && !alive[i])
-            .collect();
-
+    /// subtracting malicious contributions (called when Plasma doesn't do a recrawl).
+    pub fn subtract_failed_from_frontier(&self, failed: &Vec<usize>) -> Vec<EmbCnt> {
         let prev = &self.prev_frontier;
         let keys = &self.keys;
         self.frontier
@@ -404,7 +378,7 @@ impl GlimpseKeyCollection {
                     let dir = c % 2 == 1;
                     let mut bit_str = crate::bits_to_bitstring(&parent.path);
                     bit_str.push(if dir { '1' } else { '0' });
-                    for &i in &failed {
+                    for &i in failed {
                         // out0 is the (count, embedding) payload this client
                         // contributed to this child node during the crawl.
                         let (_st, out0, _out1) =
