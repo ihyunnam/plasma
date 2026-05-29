@@ -48,7 +48,7 @@ struct GlimpseTreeNode {
     path: Vec<bool>,
     value: EmbCnt,
     key_states: Vec<dpf::EvalState>,
-    key_values: Vec<(EmbCnt, EmbCnt)>,
+    key_values: Vec<(EmbCnt, FE)>,
 }
 
 unsafe impl Send for GlimpseTreeNode {}
@@ -110,6 +110,30 @@ pub fn is_server_zero_in_session(server_id: i8, session_idx: usize) -> bool {
 }
 
 
+/// Per-phase profiler for `tree_crawl`. Prints cumulative (`t+`) and per-step
+/// (`+Δ`) time to stdout, prefixed `[tc]` to distinguish from the server's `[tt]`.
+// Per-phase timing for make_tree_node, accumulated across the rayon par_iter in
+// tree_crawl and reported (then reset) once per crawl. Sums overlap across threads,
+// so treat these as relative CPU-time, not wall-clock.
+static MTN_BITSTR_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MTN_EVAL_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MTN_AGG_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MTN_CLEAR_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct CrawlTimer { start: std::time::Instant, last: std::time::Instant }
+impl CrawlTimer {
+    fn new() -> Self { let n = std::time::Instant::now(); CrawlTimer { start: n, last: n } }
+    fn mark(&mut self, label: &str) {
+        let now = std::time::Instant::now();
+        println!(
+            "[tc]   t+{:>7.4}s +{:>7.4}s  {label}",
+            (now - self.start).as_secs_f64(),
+            (now - self.last).as_secs_f64(),
+        );
+        self.last = now;
+    }
+}
+
 impl GlimpseKeyCollection {
     pub fn new(seed: &prg::PrgSeed, depth: usize) -> GlimpseKeyCollection {
         GlimpseKeyCollection {
@@ -140,7 +164,7 @@ impl GlimpseKeyCollection {
 
         for k in &self.keys {
             root.key_states.push(k.1.eval_init());
-            root.key_values.push((EmbCnt::zero(), EmbCnt::zero()));
+            root.key_values.push((EmbCnt::zero(), FE::new(0)));
         }
 
         self.frontier.clear();
@@ -148,19 +172,23 @@ impl GlimpseKeyCollection {
     }
 
     fn make_tree_node(&self, parent: &GlimpseTreeNode, dir: bool) -> GlimpseTreeNode {
+        use std::sync::atomic::Ordering::Relaxed;
+        let t0 = std::time::Instant::now();
         // Cumulative path string to this child — drives the VIDPF proof hash.
         let mut bit_str = crate::bits_to_bitstring(&parent.path);
         bit_str.push(if dir { '1' } else { '0' });
+        let t1 = std::time::Instant::now();
 
-        let (key_states, mut key_values): (Vec<dpf::EvalState>, Vec<(EmbCnt, EmbCnt)>) = self   // key_values are evals of all DPFKeys on this 'child' node
+        let (key_states, mut key_values): (Vec<dpf::EvalState>, Vec<(EmbCnt, FE)>) = self   // key_values are evals of all DPFKeys on this 'child' node
             .keys
             .par_iter()
             .enumerate()
             .map(|(i, key)| {   // key_states are evalstates
                 let (st, out0, out1) = key.1.eval_bit(&parent.key_states[i], dir, &bit_str);    // key.0 is mask value, key.1 is SketchDPFKey
-                (st, (out0, out1))  // out0 is count (FE) and out1 is embedding (Vec<u32>)
+                (st, (out0, out1))  // out0 is actual payload (EmbCnt) and out1 is encoding (just FE for `count`)
             })
             .unzip();
+        let t2 = std::time::Instant::now();
 
         let mut child_val = EmbCnt::zero();
         for (i, v) in key_values.iter().enumerate() {
@@ -170,6 +198,7 @@ impl GlimpseKeyCollection {
             }
         }
         child_val.reduce();
+        let t3 = std::time::Instant::now();
 
         // The per-key embeddings are now summed into `child_val` (the node value);
         // afterwards only `key_values[..].count` is read (tree_sketch_frontier), so
@@ -178,8 +207,14 @@ impl GlimpseKeyCollection {
         // frontier doubles per level, which is the level-6 multi-GB blowup.
         for v in key_values.iter_mut() {
             v.0.clear_aux();
-            v.1.clear_aux();
+            // v.1 is now a bare FE — no embedding to free.
         }
+        let t4 = std::time::Instant::now();
+
+        MTN_BITSTR_NANOS.fetch_add(t1.duration_since(t0).as_nanos() as u64, Relaxed);
+        MTN_EVAL_NANOS.fetch_add(t2.duration_since(t1).as_nanos() as u64, Relaxed);
+        MTN_AGG_NANOS.fetch_add(t3.duration_since(t2).as_nanos() as u64, Relaxed);
+        MTN_CLEAR_NANOS.fetch_add(t4.duration_since(t3).as_nanos() as u64, Relaxed);
 
         let mut child = GlimpseTreeNode {
             path: parent.path.clone(),
@@ -200,6 +235,8 @@ impl GlimpseKeyCollection {
         malicious: &Vec<usize>,
         is_last: bool,
     ) -> Vec<EmbCnt> {
+        let mut ct = CrawlTimer::new();
+        let frontier_in = self.frontier.len();
         if !malicious.is_empty() {
             if is_last {    // Disable malicious DPF keys
                 let alive_indices: Vec<usize> = self
@@ -218,6 +255,17 @@ impl GlimpseKeyCollection {
             }
             self.frontier = self.prev_frontier.clone();
         }
+        ct.mark(&format!("setup (split_by={split_by}, is_last={is_last}, mal={}, frontier_in={frontier_in})", malicious.len()));
+
+        use std::sync::atomic::Ordering::Relaxed;
+        MTN_BITSTR_NANOS.store(0, Relaxed);
+        MTN_EVAL_NANOS.store(0, Relaxed);
+        MTN_AGG_NANOS.store(0, Relaxed);
+        MTN_CLEAR_NANOS.store(0, Relaxed);
+        dpf::EB_EXPAND_NANOS.store(0, Relaxed);
+        dpf::EB_CONVERT_NANOS.store(0, Relaxed);
+        dpf::EB_WORD_NANOS.store(0, Relaxed);
+        dpf::EB_PROOF_NANOS.store(0, Relaxed);
 
         let next_frontier = self
             .frontier
@@ -230,6 +278,22 @@ impl GlimpseKeyCollection {
                 vec![child_0, child_1]
             })
             .collect::<Vec<GlimpseTreeNode>>();
+        ct.mark(&format!("make_tree_node crawl / eval_bit ({} children)", next_frontier.len()));
+        println!(
+            "[tc]     make_tree_node phases (CPU sum over {} keys): bit_str {:.4}s | eval_bit/convert {:.4}s | aggregate {:.4}s | clear_aux {:.4}s",
+            self.keys.len(),
+            MTN_BITSTR_NANOS.load(Relaxed) as f64 / 1e9,
+            MTN_EVAL_NANOS.load(Relaxed) as f64 / 1e9,
+            MTN_AGG_NANOS.load(Relaxed) as f64 / 1e9,
+            MTN_CLEAR_NANOS.load(Relaxed) as f64 / 1e9,
+        );
+        println!(
+            "[tc]       eval_bit phases (CPU sum): expand {:.4}s | convert {:.4}s | word add/negate {:.4}s | proof hash {:.4}s",
+            dpf::EB_EXPAND_NANOS.load(Relaxed) as f64 / 1e9,
+            dpf::EB_CONVERT_NANOS.load(Relaxed) as f64 / 1e9,
+            dpf::EB_WORD_NANOS.load(Relaxed) as f64 / 1e9,
+            dpf::EB_PROOF_NANOS.load(Relaxed) as f64 / 1e9,
+        );
 
         let combined_hashes = self
             .keys
@@ -246,6 +310,7 @@ impl GlimpseKeyCollection {
                 proof
             })
             .collect::<Vec<[u8; XOF_SIZE]>>();
+        ct.mark(&format!("combined_hashes / proof XOR ({} alive keys)", combined_hashes.len()));
 
         // Compute the Merkle tree based on the proofs.
         // If we are at the last level, we only need to compute the root as the malicious clients
@@ -285,14 +350,19 @@ impl GlimpseKeyCollection {
             }
         }
 
+        ct.mark(&format!("merkle build ({} roots)", self.mtree_roots.len()));
+
         self.prev_frontier = self.frontier.clone();
+        ct.mark("prev_frontier clone");
         self.frontier = next_frontier;
 
-        // Summed evaluations (COUNT ONLY) for different 'child' prefixes
-        self.frontier
+        // Summed evaluations (full EmbCnt) for different 'child' prefixes
+        let out = self.frontier
             .par_iter()
-            .map(|node| node.value.clone()) // TODO sum of paylods but embedding wiped out with clear_aux()
-            .collect::<Vec<EmbCnt>>()
+            .map(|node| node.value.clone())
+            .collect::<Vec<EmbCnt>>();
+        ct.mark("collect return node values");
+        out
     }
 
     pub fn get_mtree_roots_size(&self) -> usize {
@@ -333,7 +403,7 @@ impl GlimpseKeyCollection {
             .map(|i| {
                 self.frontier
                     .iter()
-                    .map(|node| (node.key_values[i].0.count, node.key_values[i].1.count))
+                    .map(|node| (node.key_values[i].0.count, node.key_values[i].1))
                     .collect()
             })
             .collect();
@@ -428,7 +498,7 @@ impl GlimpseKeyCollection {
             .collect::<Vec<EmbCnt>>()
     }
 
-    pub fn get_y_values(&self) -> Vec<&Vec<(EmbCnt, EmbCnt)>> {
+    pub fn get_y_values(&self) -> Vec<&Vec<(EmbCnt, FE)>> {
         self.frontier
             .par_iter()
             .map(|node| &node.key_values)

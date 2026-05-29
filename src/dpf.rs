@@ -19,6 +19,16 @@ use counttree::sketch::{EmbCnt, SketchOutput, TRIPLES_PER_LEVEL};
 use counttree::Group as CtGroup;
 use counttree::Share as CtShare;
 
+// Per-phase timing for DPFKey::eval_bit, accumulated across the rayon par_iter in
+// collect::tree_crawl and reported (then reset) there once per crawl. Sums overlap
+// across threads, so treat these as relative CPU-time, not wall-clock. NOTE: for the
+// cheap `expand` phase the Instant::now() + atomic-add overhead itself inflates the
+// number; the meaningful comparison is convert vs proof.
+pub(crate) static EB_EXPAND_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static EB_CONVERT_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static EB_WORD_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static EB_PROOF_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CorWord<T> {
     seed: prg::PrgSeed,
@@ -211,6 +221,8 @@ where
     }
 
     pub fn eval_bit(&self, state: &EvalState, dir: bool, bit_str: &String) -> (EvalState, T) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let t0 = std::time::Instant::now();
         let tau = state.seed.expand_dir(!dir, dir);
         let mut seed = tau.seeds.get(dir).clone();
         let mut new_bit = *tau.bits.get(dir);
@@ -219,9 +231,11 @@ where
             seed = &seed ^ &self.cor_words[state.level].seed;
             new_bit ^= self.cor_words[state.level].bits.get(dir);
         }
+        let t1 = std::time::Instant::now();
 
         let converted = seed.convert::<T>();
         let new_seed = converted.seed;
+        let t2 = std::time::Instant::now();
 
         let mut word = converted.word;
         if new_bit {
@@ -231,6 +245,7 @@ where
         if self.key_idx {
             word.negate()
         }
+        let t3 = std::time::Instant::now();
 
         // Compute Plasma proofs
         let h2 = {
@@ -254,6 +269,12 @@ where
             .as_slice()
             .try_into()
             .unwrap();
+        let t4 = std::time::Instant::now();
+
+        EB_EXPAND_NANOS.fetch_add(t1.duration_since(t0).as_nanos() as u64, Relaxed);
+        EB_CONVERT_NANOS.fetch_add(t2.duration_since(t1).as_nanos() as u64, Relaxed);
+        EB_WORD_NANOS.fetch_add(t3.duration_since(t2).as_nanos() as u64, Relaxed);
+        EB_PROOF_NANOS.fetch_add(t4.duration_since(t3).as_nanos() as u64, Relaxed);
 
         (
             EvalState {
@@ -324,13 +345,13 @@ fn fe_from_rng(rng: &mut impl rand::Rng) -> FE {
 
 /// Poplar malicious-secure sketch DPF key built on plasma's **proof-carrying** VIDPF
 /// (`DPFKey`, whose `EvalState` carries the `.proof` that `GlimpseKeyCollection`'s
-/// Merkle tree consumes). DPFKey payload is hardcoded to `(EmbCnt, EmbCnt) = (x, kx)` of Poplar encoding, 
+/// Merkle tree consumes). DPFKey payload is hardcoded to `(EmbCnt, FE) = (x, κ·count_x)` of Poplar encoding,
 /// and the Poplar 0/1 sketching + MAC checks run over FE.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SketchDPFKey {
     pub mac_key: FE,
     pub mac_key2: FE,
-    key: DPFKey<(EmbCnt, EmbCnt)>, // the payload is (x,kx)
+    key: DPFKey<(EmbCnt, FE)>, // the payload is (x, κ·count_x); MAC half is FE-only
     pub triples: Vec<TripleShare<FE>>,
 }
 
@@ -346,13 +367,12 @@ impl SketchDPFKey {
         mac_key2.mul(&mac_key);
         let (mac_key2_sh0, mac_key2_sh1) = mac_key2.share();
 
-        let mut values: Vec<(EmbCnt, EmbCnt)> = Vec::with_capacity(alpha_bits.len());
+        let mut values: Vec<(EmbCnt, FE)> = Vec::with_capacity(alpha_bits.len());
         for i in 0..alpha_bits.len() {
             let mut mac_val = values_in[i].count.clone();
             mac_val.mul(&mac_key);
             let payload = values_in[i].clone();
-            let encoding = EmbCnt { count: mac_val, embedding: vec![0u32] }; // unused
-            values.push((payload, encoding));
+            values.push((payload, mac_val));
         }
 
         let (dpf_key0, dpf_key1) = DPFKey::gen(alpha_bits, &values);
@@ -430,14 +450,14 @@ impl SketchDPFKey {
         state: &EvalState,
         dir: bool,
         bit_str: &String,
-    ) -> (EvalState, EmbCnt, EmbCnt) {
+    ) -> (EvalState, EmbCnt, FE) {
         let (st, val) = self.key.eval_bit(state, dir, bit_str);
         (st, val.0, val.1)
     }
 
     /// Full path eval, threading the proof through `pi`. Returns the leaf
-    /// `(x, κ·x)` pair.
-    pub fn eval(&self, idx: &[bool], pi: &mut [u8; XOF_SIZE]) -> (EmbCnt, EmbCnt) {
+    /// `(x, κ·count_x)` pair.
+    pub fn eval(&self, idx: &[bool], pi: &mut [u8; XOF_SIZE]) -> (EmbCnt, FE) {
         let (_vals, last) = self.key.eval(idx, pi);
         (last.0, last.1)
     }

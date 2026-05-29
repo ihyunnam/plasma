@@ -12,6 +12,7 @@
 // (for the sketch). Method calls in plasma resolve to the plasma trait (only it
 // is in scope via the collection bounds), so there is no ambiguity.
 pub use counttree::sketch::{DIM, EmbCnt};
+use rayon::iter::IntoParallelIterator;
 
 use counttree::fastfield::FE;
 
@@ -75,6 +76,67 @@ impl crate::Group for EmbCnt {
 
 impl crate::Share for EmbCnt {}
 
+// Heterogeneous DPF payload `(x, κ·count_x)`: the value carries the full
+// embedding, the MAC half is just the `FE` count (the only part the sketch/MAC
+// checks read). Replaces the old `(EmbCnt, EmbCnt)` payload, halving the keystream
+// `convert` must generate per `eval_bit` and dropping a 768-wide alloc/clear.
+// Disjoint from `impl<T> Group for (T, T)` (no `T` is both `EmbCnt` and `FE`).
+impl crate::Group for (EmbCnt, FE) {
+    #[inline]
+    fn zero() -> Self {
+        (<EmbCnt as crate::Group>::zero(), FE::new(0))
+    }
+
+    #[inline]
+    fn one() -> Self {
+        (<EmbCnt as crate::Group>::one(), FE::new(1))
+    }
+
+    #[inline]
+    fn negate(&mut self) {
+        self.0.negate();
+        <FE as counttree::Group>::negate(&mut self.1);
+    }
+
+    #[inline]
+    fn add(&mut self, other: &Self) {
+        self.0.add(&other.0);
+        <FE as counttree::Group>::add(&mut self.1, &other.1);
+    }
+
+    #[inline]
+    fn sub(&mut self, other: &Self) {
+        self.0.sub(&other.0);
+        <FE as counttree::Group>::sub(&mut self.1, &other.1);
+    }
+
+    /// Not read on the payload pair (mirrors the `(T, T)` impl).
+    #[inline]
+    fn value(self) -> u64 {
+        0u64
+    }
+
+    /// `.1` is a bare `FE`; only the value half holds a freeable embedding.
+    #[inline]
+    fn clear_aux(&mut self) {
+        self.0.clear_aux();
+    }
+}
+
+impl crate::prg::FromRng for (EmbCnt, FE) {
+    fn from_rng(&mut self, rng: &mut (impl rand::Rng + rand_core::RngCore)) {
+        self.0 = <EmbCnt as crate::Group>::zero();
+        self.0.from_rng(rng);
+        // MAC half: a single `FE`, rejection-sampled like `EmbCnt`'s count.
+        loop {
+            if let Some(x) = FE::from_u64_unbiased(rand::Rng::gen::<u64>(rng)) {
+                self.1 = x;
+                break;
+            }
+        }
+    }
+}
+
 impl crate::prg::FromRng for EmbCnt {
     fn from_rng(&mut self, rng: &mut (impl rand::Rng + rand_core::RngCore)) {
         // Count: rejection-sample a uniform `FE` from plasma's RNG via `FE`'s
@@ -90,8 +152,6 @@ impl crate::prg::FromRng for EmbCnt {
         if self.embedding.len() != DIM {
             self.embedding = vec![0u32; DIM];
         }
-        for x in self.embedding.iter_mut() {
-            *x = rand::Rng::gen::<u32>(rng);
-        }
+        rng.fill(&mut self.embedding[..]);
     }
 }
