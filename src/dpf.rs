@@ -210,7 +210,21 @@ where
         )
     }
 
+    /// Full proof-carrying per-bit eval (expands the whole payload).
+    #[inline]
     pub fn eval_bit(&self, state: &EvalState, dir: bool, bit_str: &String) -> (EvalState, T) {
+        self.eval_bit_inner(state, dir, bit_str, true)
+    }
+
+    /// Count+MAC-only per-bit eval: identical state/proof to `eval_bit`, but the
+    /// returned payload's DIM-wide embedding is left empty (no 768-wide PRG
+    /// expansion). Used by the count-only tree traversal.
+    #[inline]
+    pub fn eval_bit_no_aux(&self, state: &EvalState, dir: bool, bit_str: &String) -> (EvalState, T) {
+        self.eval_bit_inner(state, dir, bit_str, false)
+    }
+
+    fn eval_bit_inner(&self, state: &EvalState, dir: bool, bit_str: &String, aux: bool) -> (EvalState, T) {
         let tau = state.seed.expand_dir(!dir, dir);
         let mut seed = tau.seeds.get(dir).clone();
         let mut new_bit = *tau.bits.get(dir);
@@ -220,7 +234,9 @@ where
             new_bit ^= self.cor_words[state.level].bits.get(dir);
         }
 
-        let converted = seed.convert::<T>();
+        // `new_seed` is drawn before the payload in both variants, so the proof
+        // (which hashes only `new_seed`) is identical whether or not `aux` is set.
+        let converted = if aux { seed.convert::<T>() } else { seed.convert_no_aux::<T>() };
         let new_seed = converted.seed;
 
         let mut word = converted.word;
@@ -273,6 +289,32 @@ where
             bit: self.key_idx,
             proof: [0u8; XOF_SIZE],
         }
+    }
+
+    /// Evaluate the payload at a single node identified by `idx` (a bit-path),
+    /// descending **count-only** (`eval_bit_no_aux` — correct `new_seed` via
+    /// `convert_no_aux`, but no 768-wide embedding expansion) and expanding the
+    /// full payload only at the final node. `idx` may be shorter than the full
+    /// domain (coresets sit at varying depths). The proof is discarded — this is
+    /// a value-only read for the post-traversal coreset embedding pass.
+    ///
+    /// NB: unlike counttree's `eval_non_incr`, the descent cannot skip `convert`
+    /// entirely: plasma threads `convert(seed).seed` (not the raw seed) as the
+    /// next state, so the seed must be re-derived each level. `eval_bit_no_aux`
+    /// does that while still skipping the embedding.
+    pub fn eval_non_incr(&self, idx: &[bool]) -> T {
+        debug_assert!(!idx.is_empty());
+        debug_assert!(idx.len() <= self.domain_size());
+        let mut state = self.eval_init();
+        let mut bit_str = String::new();
+        for &b in idx.iter().take(idx.len() - 1) {
+            bit_str.push(if b { '1' } else { '0' });
+            let (next, _w) = self.eval_bit_no_aux(&state, b, &bit_str);
+            state = next;
+        }
+        bit_str.push(if *idx.last().unwrap() { '1' } else { '0' });
+        let (_st, word) = self.eval_bit(&state, *idx.last().unwrap(), &bit_str);
+        word
     }
 
     pub fn eval(&self, idx: &[bool], pi: &mut [u8; XOF_SIZE]) -> (Vec<T>, T) {
@@ -434,11 +476,30 @@ impl SketchDPFKey {
         (st, val.0, val.1)
     }
 
+    /// Count+MAC-only per-bit eval: same state/proof as `eval_bit`, but the
+    /// returned `EmbCnt`'s embedding is empty (no 768-wide expansion).
+    pub fn eval_bit_no_aux(
+        &self,
+        state: &EvalState,
+        dir: bool,
+        bit_str: &String,
+    ) -> (EvalState, EmbCnt, FE) {
+        let (st, val) = self.key.eval_bit_no_aux(state, dir, bit_str);
+        (st, val.0, val.1)
+    }
+
     /// Full path eval, threading the proof through `pi`. Returns the leaf
     /// `(x, κ·count_x)` pair.
     pub fn eval(&self, idx: &[bool], pi: &mut [u8; XOF_SIZE]) -> (EmbCnt, FE) {
         let (_vals, last) = self.key.eval(idx, pi);
         (last.0, last.1)
+    }
+
+    /// This key's embedding payload at the node `path` (seed-only descent, full
+    /// payload expanded only at the leaf). Used by the post-traversal coreset
+    /// embedding pass; `path` may be any depth `1..=MAX_TREE_DEPTH`.
+    pub fn eval_emb_at_path(&self, path: &[bool]) -> EmbCnt {
+        self.key.eval_non_incr(path).0
     }
 
     pub fn domain_size(&self) -> usize {

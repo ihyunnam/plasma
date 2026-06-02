@@ -117,6 +117,29 @@ impl PrgSeed {
         out
     }
 
+    /// Like [`convert`](Self::convert) but fills only the count+MAC of the payload
+    /// and skips the DIM-wide embedding (`from_rng_no_aux`). `out.seed` (the
+    /// descent seed) is drawn first, so it is byte-identical to `convert`'s — the
+    /// Plasma proof, which hashes only `new_seed`, is therefore unchanged.
+    pub fn convert_no_aux<T: FromRng + crate::Group>(self: &PrgSeed) -> ConvertOutput<T> {
+        let mut out = ConvertOutput {
+            seed: PrgSeed::zero(),
+            word: T::zero(),
+        };
+
+        FIXED_KEY_STREAM.with(|s_in| {
+            let mut s = s_in.borrow_mut();
+            s.set_key(&self.key);
+            s.fill_bytes(&mut out.seed.key);
+            unsafe {
+                let sp = s_in.as_ptr();
+                out.word.from_rng_no_aux(&mut *sp);
+            }
+        });
+
+        out
+    }
+
     pub fn zero() -> PrgSeed {
         PrgSeed {
             key: [0; AES_KEY_SIZE],
@@ -146,6 +169,13 @@ impl ops::BitXor for &PrgSeed {
 
 pub trait FromRng {
     fn from_rng(&mut self, stream: &mut (impl rand::Rng + rand_core::RngCore));
+
+    /// Fill everything except the DIM-wide "aux" (embedding) payload, leaving it
+    /// empty. Used by the count-only tree traversal so the expensive 768-wide PRG
+    /// expansion is deferred to the per-coreset end pass. Default = full fill.
+    fn from_rng_no_aux(&mut self, stream: &mut (impl rand::Rng + rand_core::RngCore)) {
+        self.from_rng(stream);
+    }
 
     fn randomize(&mut self) {
         self.from_rng(&mut rand::thread_rng());

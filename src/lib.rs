@@ -163,6 +163,66 @@ pub fn take<T>(vec: &mut Vec<T>, index: usize) -> Option<T> {
 mod tests {
     use super::*;
 
+    // Reconstructing a `(EmbCnt, FE)` value from its two key shares at a node via
+    // the seed-only end-pass eval (`eval_non_incr`) yields the planted value at
+    // the target path and zero off-path. Exercises the embedding reconstruction
+    // and the reordered `from_rng` (count, MAC, embedding) end-to-end.
+    #[test]
+    fn eval_non_incr_roundtrip() {
+        use crate::dpf::DPFKey;
+        use crate::emb_cnt::{EmbCnt, DIM};
+        use counttree::fastfield::FE;
+        use counttree::Group as CtGroup;
+
+        let (k0, k1) = DPFKey::<(EmbCnt, FE)>::gen_from_str("101");
+
+        let recon = |path: &[bool]| -> (EmbCnt, FE) {
+            let mut a = k0.eval_non_incr(path);
+            let b = k1.eval_non_incr(path);
+            <(EmbCnt, FE) as crate::Group>::add(&mut a, &b);
+            CtGroup::reduce(&mut a.0);
+            CtGroup::reduce(&mut a.1);
+            a
+        };
+
+        // Target path "101": value == T::one() = (count 1, embedding [1; DIM], MAC 1).
+        let on = recon(&string_to_bits("101"));
+        assert_eq!(on.0.count.value(), 1, "target count");
+        assert_eq!(on.1.value(), 1, "target MAC");
+        assert_eq!(on.0.embedding.len(), DIM);
+        assert!(on.0.embedding.iter().all(|&x| x == 1), "target embedding");
+
+        // Off-path "100": reconstructs to zero in count, MAC, and embedding.
+        let off = recon(&string_to_bits("100"));
+        assert_eq!(off.0.count.value(), 0, "off-path count");
+        assert_eq!(off.1.value(), 0, "off-path MAC");
+        assert!(off.0.embedding.iter().all(|&x| x == 0), "off-path embedding");
+    }
+
+    // `eval_bit_no_aux` returns the identical state (seed, bit, proof) and the
+    // identical count+MAC as `eval_bit`, only with an empty embedding — so the
+    // Merkle proof and the sketch are unaffected by the count-only traversal.
+    #[test]
+    fn no_aux_matches_full() {
+        use crate::dpf::DPFKey;
+        use crate::emb_cnt::EmbCnt;
+        use counttree::fastfield::FE;
+
+        let (k0, _k1) = DPFKey::<(EmbCnt, FE)>::gen_from_str("1101");
+        let init = k0.eval_init();
+        let bs = "1".to_string();
+        let (s_full, w_full) = k0.eval_bit(&init, true, &bs);
+        let (s_na, w_na) = k0.eval_bit_no_aux(&init, true, &bs);
+
+        assert_eq!(s_full.seed.key, s_na.seed.key, "seed");
+        assert_eq!(s_full.bit, s_na.bit, "bit");
+        assert_eq!(s_full.proof, s_na.proof, "proof");
+        assert_eq!(w_full.0.count.value(), w_na.0.count.value(), "count");
+        assert_eq!(w_full.1.value(), w_na.1.value(), "MAC");
+        assert!(w_na.0.embedding.is_empty(), "no_aux embedding empty");
+        assert!(!w_full.0.embedding.is_empty(), "full embedding present");
+    }
+
     #[test]
     fn share() {
         let val = u64::random();

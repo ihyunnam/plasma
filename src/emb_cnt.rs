@@ -123,17 +123,36 @@ impl crate::Group for (EmbCnt, FE) {
     }
 }
 
+/// Rejection-sample a uniform `FE` from plasma's RNG via the public unbiased
+/// constructor (avoids counttree's `rand_core` 0.5 `FromRng` for `FE`).
+#[inline]
+fn fe_sample(rng: &mut (impl rand::Rng + rand_core::RngCore)) -> FE {
+    loop {
+        if let Some(x) = FE::from_u64_unbiased(rand::Rng::gen::<u64>(rng)) {
+            return x;
+        }
+    }
+}
+
 impl crate::prg::FromRng for (EmbCnt, FE) {
     fn from_rng(&mut self, rng: &mut (impl rand::Rng + rand_core::RngCore)) {
-        self.0 = <EmbCnt as crate::Group>::zero();
-        self.0.from_rng(rng);
-        // MAC half: a single `FE`, rejection-sampled like `EmbCnt`'s count.
-        loop {
-            if let Some(x) = FE::from_u64_unbiased(rand::Rng::gen::<u64>(rng)) {
-                self.1 = x;
-                break;
-            }
+        // Order matters: count, then MAC, then the DIM-wide embedding LAST. This
+        // lets `from_rng_no_aux` reproduce the exact count+MAC bytes and stop
+        // before the embedding. (gen and eval both route through this single
+        // `from_rng`, so the layout stays internally consistent.)
+        self.0.count = fe_sample(rng);
+        self.1 = fe_sample(rng);
+        if self.0.embedding.len() != DIM {
+            self.0.embedding = vec![0u32; DIM];
         }
+        rng.fill(&mut self.0.embedding[..]);
+    }
+
+    fn from_rng_no_aux(&mut self, rng: &mut (impl rand::Rng + rand_core::RngCore)) {
+        // Same count+MAC draws as `from_rng`, then skip the embedding fill.
+        self.0.count = fe_sample(rng);
+        self.1 = fe_sample(rng);
+        self.0.embedding = Vec::new();
     }
 }
 

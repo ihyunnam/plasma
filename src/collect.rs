@@ -166,34 +166,29 @@ impl GlimpseKeyCollection {
         let mut bit_str = crate::bits_to_bitstring(&parent.path);
         bit_str.push(if dir { '1' } else { '0' });
 
-        let (key_states, mut key_values): (Vec<dpf::EvalState>, Vec<(EmbCnt, FE)>) = self   // key_values are evals of all DPFKeys on this 'child' node
+        // Count+MAC-only eval (`eval_bit_no_aux`): each `out0` carries the count
+        // with an *empty* embedding — the 768-wide expansion is deferred to the
+        // per-coreset end pass (`eval_embeddings_on_paths`). The proof in `st` is
+        // identical to the full eval, so the Merkle check is unaffected.
+        let (key_states, key_values): (Vec<dpf::EvalState>, Vec<(EmbCnt, FE)>) = self
             .keys
             .par_iter()
             .enumerate()
-            .map(|(i, key)| {   // key_states are evalstates
-                let (st, out0, out1) = key.1.eval_bit(&parent.key_states[i], dir, &bit_str);    // key.0 is mask value, key.1 is SketchDPFKey
-                (st, (out0, out1))  // out0 is actual payload (EmbCnt) and out1 is encoding (just FE for `count`)
+            .map(|(i, key)| {
+                let (st, out0, out1) = key.1.eval_bit_no_aux(&parent.key_states[i], dir, &bit_str);
+                (st, (out0, out1))  // out0 = (count, <empty embedding>), out1 = MAC FE
             })
             .unzip();
 
-        let mut child_val = EmbCnt::zero();
+        // Node value is count-only (empty embedding); thresholding reads `.count`,
+        // the sketch reads `key_values[..].0.count` and `.1`.
+        let mut child_val = EmbCnt { count: FE::new(0), embedding: Vec::new() };
         for (i, v) in key_values.iter().enumerate() {
-            // Add together full EmbCnt paylods of only _live_ values
             if self.keys[i].0 {
                 child_val.add_lazy(&v.0);
             }
         }
         child_val.reduce();
-
-        // The per-key embeddings are now summed into `child_val` (the node value);
-        // afterwards only `key_values[..].count` is read (tree_sketch_frontier), so
-        // free the DIM-wide embedding vectors. Without this, each frontier node
-        // retains n_keys × 2 × DIM u32s of never-read embedding share — and the
-        // frontier doubles per level, which is the level-6 multi-GB blowup.
-        for v in key_values.iter_mut() {
-            v.0.clear_aux();
-            // v.1 is now a bare FE — no embedding to free.
-        }
 
         let mut child = GlimpseTreeNode {
             path: parent.path.clone(),
@@ -337,7 +332,7 @@ impl GlimpseKeyCollection {
                         let mut prefix = String::new();
                         for &b in &parent_path {
                             prefix.push(if b { '1' } else { '0' });
-                            let (next, _o0, _o1) = key.1.eval_bit(&st, b, &prefix);
+                            let (next, _o0, _o1) = key.1.eval_bit_no_aux(&st, b, &prefix);
                             st = next;
                         }
                         st
@@ -346,7 +341,7 @@ impl GlimpseKeyCollection {
 
                 GlimpseTreeNode {
                     path: parent_path,
-                    value: EmbCnt::zero(),
+                    value: EmbCnt { count: FE::new(0), embedding: Vec::new() },
                     key_states,
                     key_values: vec![],
                 }
@@ -422,8 +417,10 @@ impl GlimpseKeyCollection {
         }
     }
 
-    /// Correct the already-crawled frontier node values (count *and* embedding) by
-    /// subtracting malicious contributions (called when Plasma doesn't do a recrawl).
+    /// Correct the already-crawled frontier node **counts** by subtracting the
+    /// Poplar-failed keys' contributions (called when Plasma doesn't do a recrawl).
+    /// Count-only: embeddings are deferred to `eval_embeddings_on_paths`, which
+    /// already sums over the final alive mask (so failed keys are excluded there).
     pub fn subtract_failed_from_frontier(&self, failed: &Vec<usize>) -> Vec<EmbCnt> {
         let keys = &self.keys;
         self.frontier
@@ -437,23 +434,52 @@ impl GlimpseKeyCollection {
                     let parent_path = &node.path[..node.path.len() - 1];
                     let bit_str = crate::bits_to_bitstring(&node.path);
                     for &i in failed {
-                        // Re-derive this failed key's parent eval state by replaying eval_bit from the
-                        // root down the parent path (cost ∝ failures · depth), then
-                        // eval the child bit to recover the (count, embedding)
-                        // payload it contributed to this node.
+                        // Re-derive this failed key's parent eval state by replaying
+                        // eval_bit_no_aux from the root down the parent path (cost ∝
+                        // failures · depth), then eval the child bit to recover the
+                        // count it contributed to this node.
                         let mut st = keys[i].1.eval_init();
                         let mut prefix = String::new();
                         for &b in parent_path {
                             prefix.push(if b { '1' } else { '0' });
-                            let (next, _o0, _o1) = keys[i].1.eval_bit(&st, b, &prefix);
+                            let (next, _o0, _o1) = keys[i].1.eval_bit_no_aux(&st, b, &prefix);
                             st = next;
                         }
-                        let (_st, out0, _out1) = keys[i].1.eval_bit(&st, dir, &bit_str);
+                        let (_st, out0, _out1) = keys[i].1.eval_bit_no_aux(&st, dir, &bit_str);
                         val.sub(&out0);
                     }
                     val.reduce();
                 }
                 val
+            })
+            .collect()
+    }
+
+    /// Local embedding shares for each coreset, identified by its node bit-path.
+    /// For each path, sums every **alive** key's embedding payload at that node
+    /// (seed-only descent, 768-wide expansion only at the leaf). Returned in the
+    /// same order as `paths`, so it lines up with the caller's coreset counts.
+    pub fn eval_embeddings_on_paths(&self, paths: &[Vec<bool>]) -> Vec<EmbCnt> {
+        paths
+            .par_iter()
+            .map(|path| {
+                let mut acc = EmbCnt::zero();
+                for (alive, key) in &self.keys {
+                    if !*alive {
+                        continue;
+                    }
+                    if path.is_empty() {
+                        // Root coreset: the global embedding sum = each key's
+                        // contribution summed over both level-1 children (a key is
+                        // nonzero under exactly one), so this totals every key.
+                        acc.add_lazy(&key.eval_emb_at_path(&[false]));
+                        acc.add_lazy(&key.eval_emb_at_path(&[true]));
+                    } else {
+                        acc.add_lazy(&key.eval_emb_at_path(path));
+                    }
+                }
+                acc.reduce();
+                acc
             })
             .collect()
     }
