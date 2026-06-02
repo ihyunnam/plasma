@@ -60,7 +60,6 @@ pub struct GlimpseKeyCollection {
     depth: usize,
     pub keys: Vec<(bool, dpf::SketchDPFKey)>,
     frontier: Vec<GlimpseTreeNode>,
-    prev_frontier: Vec<GlimpseTreeNode>,
     final_proofs: Vec<[u8; XOF_SIZE]>,
     mtree_roots: Vec<[u8; XOF_SIZE]>,
     mtree_indices: Vec<usize>,
@@ -133,7 +132,6 @@ impl GlimpseKeyCollection {
             depth,
             keys: vec![],
             frontier: vec![],
-            prev_frontier: vec![],
             final_proofs: vec![],
             mtree_roots: vec![],
             mtree_indices: vec![],
@@ -234,7 +232,7 @@ impl GlimpseKeyCollection {
                     }
                 }
             }
-            self.frontier = self.prev_frontier.clone();
+            self.frontier = self.recompute_prev_frontier();
         }
         // ct.mark(&format!("setup (split_by={split_by}, is_last={is_last}, mal={}, frontier_in={frontier_in})", malicious.len()));
 
@@ -308,8 +306,6 @@ impl GlimpseKeyCollection {
 
         // ct.mark(&format!("merkle build ({} roots)", self.mtree_roots.len()));
 
-        self.prev_frontier = self.frontier.clone();
-        // ct.mark("prev_frontier clone");
         self.frontier = next_frontier;
 
         // Summed evaluations (full EmbCnt) for different 'child' prefixes
@@ -319,6 +315,43 @@ impl GlimpseKeyCollection {
             .collect::<Vec<EmbCnt>>();
         // ct.mark("collect return node values");
         out
+    }
+
+    /// Rebuild the parent-level frontier (the level above `self.frontier`) on
+    /// demand (replacing Plasma's `prev_frontier` as we only rarely call this).
+    /// Only `path` and `key_states` are filled — `make_tree_node`
+    /// reads nothing else from the parent.
+    fn recompute_prev_frontier(&self) -> Vec<GlimpseTreeNode> {
+        let n_parents = self.frontier.len() / 2;
+        (0..n_parents)
+            .into_par_iter()
+            .map(|p| {
+                let child_path = &self.frontier[2 * p].path;
+                let parent_path = child_path[..child_path.len() - 1].to_vec();
+
+                let key_states = self
+                    .keys
+                    .iter()
+                    .map(|key| {
+                        let mut st = key.1.eval_init();
+                        let mut prefix = String::new();
+                        for &b in &parent_path {
+                            prefix.push(if b { '1' } else { '0' });
+                            let (next, _o0, _o1) = key.1.eval_bit(&st, b, &prefix);
+                            st = next;
+                        }
+                        st
+                    })
+                    .collect();
+
+                GlimpseTreeNode {
+                    path: parent_path,
+                    value: EmbCnt::zero(),
+                    key_states,
+                    key_values: vec![],
+                }
+            })
+            .collect()
     }
 
     pub fn get_mtree_roots_size(&self) -> usize {
@@ -392,23 +425,30 @@ impl GlimpseKeyCollection {
     /// Correct the already-crawled frontier node values (count *and* embedding) by
     /// subtracting malicious contributions (called when Plasma doesn't do a recrawl).
     pub fn subtract_failed_from_frontier(&self, failed: &Vec<usize>) -> Vec<EmbCnt> {
-        let prev = &self.prev_frontier;
         let keys = &self.keys;
         self.frontier
             .par_iter()
-            .enumerate()
-            .map(|(c, node)| {
+            .map(|node| {
                 let mut val = node.value.clone();
                 if !failed.is_empty() {
-                    let parent = &prev[c / 2];
-                    let dir = c % 2 == 1;
-                    let mut bit_str = crate::bits_to_bitstring(&parent.path);
-                    bit_str.push(if dir { '1' } else { '0' });
+                    // This child node's full path string drives the final eval;
+                    // its parent path is the same minus the last (direction) bit.
+                    let dir = *node.path.last().expect("non-root frontier node");
+                    let parent_path = &node.path[..node.path.len() - 1];
+                    let bit_str = crate::bits_to_bitstring(&node.path);
                     for &i in failed {
-                        // out0 is the (count, embedding) payload this client
-                        // contributed to this child node during the crawl.
-                        let (_st, out0, _out1) =
-                            keys[i].1.eval_bit(&parent.key_states[i], dir, &bit_str);
+                        // Re-derive this failed key's parent eval state by replaying eval_bit from the
+                        // root down the parent path (cost ∝ failures · depth), then
+                        // eval the child bit to recover the (count, embedding)
+                        // payload it contributed to this node.
+                        let mut st = keys[i].1.eval_init();
+                        let mut prefix = String::new();
+                        for &b in parent_path {
+                            prefix.push(if b { '1' } else { '0' });
+                            let (next, _o0, _o1) = keys[i].1.eval_bit(&st, b, &prefix);
+                            st = next;
+                        }
+                        let (_st, out0, _out1) = keys[i].1.eval_bit(&st, dir, &bit_str);
                         val.sub(&out0);
                     }
                     val.reduce();
