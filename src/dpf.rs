@@ -213,7 +213,7 @@ where
     /// Full proof-carrying per-bit eval (expands the whole payload).
     #[inline]
     pub fn eval_bit(&self, state: &EvalState, dir: bool, bit_str: &String) -> (EvalState, T) {
-        self.eval_bit_inner(state, dir, bit_str, true)
+        self.eval_bit_inner(state, dir, bit_str, true, true)
     }
 
     /// Count+MAC-only per-bit eval: identical state/proof to `eval_bit`, but the
@@ -221,10 +221,14 @@ where
     /// expansion). Used by the count-only tree traversal.
     #[inline]
     pub fn eval_bit_no_aux(&self, state: &EvalState, dir: bool, bit_str: &String) -> (EvalState, T) {
-        self.eval_bit_inner(state, dir, bit_str, false)
+        self.eval_bit_inner(state, dir, bit_str, false, true)
     }
 
-    fn eval_bit_inner(&self, state: &EvalState, dir: bool, bit_str: &String, aux: bool) -> (EvalState, T) {
+    /// `aux`       — expand the DIM-wide embedding (`convert`) vs leave it empty (`convert_no_aux`).
+    /// `gen_proof` — compute the Plasma proof (and read `bit_str`) vs skip it and
+    ///               return a zeroed proof. Value-only readers (`eval_non_incr`'s
+    ///               leaf) pass `false`; the returned `word` is unaffected either way.
+    fn eval_bit_inner(&self, state: &EvalState, dir: bool, bit_str: &String, aux: bool, gen_proof: bool) -> (EvalState, T) {
         let tau = state.seed.expand_dir(!dir, dir);
         let mut seed = tau.seeds.get(dir).clone();
         let mut new_bit = *tau.bits.get(dir);
@@ -237,7 +241,7 @@ where
         // `new_seed` is drawn before the payload in both variants, so the proof
         // (which hashes only `new_seed`) is identical whether or not `aux` is set.
         let converted = if aux { seed.convert::<T>() } else { seed.convert_no_aux::<T>() };
-        let new_seed = converted.seed;
+        let new_seed = converted.seed;  // convert and convert_no_aux touches converted.seed the same way (just differ on converted.word)
 
         let mut word = converted.word;
         if new_bit {
@@ -248,28 +252,32 @@ where
             word.negate()
         }
 
-        // Compute Plasma proofs
-        let h2 = {
-            let mut hasher = Hasher::new();
-            hasher.update_rayon(bit_str.as_bytes());
-            hasher.update_rayon(&new_seed.key);
-            let pi_prime = hasher.finalize();
+        // Compute Plasma proofs — skipped (zeroed) when the caller only wants `word`.
+        let proof = if gen_proof {
+            let h2 = {
+                let mut hasher = Hasher::new();
+                hasher.update_rayon(bit_str.as_bytes());
+                hasher.update_rayon(&new_seed.key);
+                let pi_prime = hasher.finalize();
 
-            let h: [u8; XOF_SIZE] = if !new_bit {
-                pi_prime.as_bytes()[..XOF_SIZE].try_into().unwrap()
-            } else {
-                xor_vec(&self.cs[state.level], &pi_prime.as_bytes()[..XOF_SIZE])[..XOF_SIZE]
-                    .try_into()
-                    .unwrap()
+                let h: [u8; XOF_SIZE] = if !new_bit {
+                    pi_prime.as_bytes()[..XOF_SIZE].try_into().unwrap()
+                } else {
+                    xor_vec(&self.cs[state.level], &pi_prime.as_bytes()[..XOF_SIZE])[..XOF_SIZE]
+                        .try_into()
+                        .unwrap()
+                };
+                hasher.reset();
+                hasher.update_rayon(&h);
+                hasher.finalize()
             };
-            hasher.reset();
-            hasher.update_rayon(&h);
-            hasher.finalize()
+            xor_vec(h2.as_bytes(), &state.proof)
+                .as_slice()
+                .try_into()
+                .unwrap()
+        } else {
+            [0u8; XOF_SIZE]
         };
-        let proof = xor_vec(h2.as_bytes(), &state.proof)
-            .as_slice()
-            .try_into()
-            .unwrap();
 
         (
             EvalState {
@@ -291,29 +299,46 @@ where
         }
     }
 
-    /// Evaluate the payload at a single node identified by `idx` (a bit-path),
-    /// descending **count-only** (`eval_bit_no_aux` — correct `new_seed` via
-    /// `convert_no_aux`, but no 768-wide embedding expansion) and expanding the
-    /// full payload only at the final node. `idx` may be shorter than the full
-    /// domain (coresets sit at varying depths). The proof is discarded — this is
-    /// a value-only read for the post-traversal coreset embedding pass.
-    ///
-    /// NB: unlike counttree's `eval_non_incr`, the descent cannot skip `convert`
-    /// entirely: plasma threads `convert(seed).seed` (not the raw seed) as the
-    /// next state, so the seed must be re-derived each level. `eval_bit_no_aux`
-    /// does that while still skipping the embedding.
+    /// Advance evalstate one level computing **only** the next state made of its
+    /// seed (via `convert_seed_only`) and control bit, with no payload (`word') or proof.
+    /// Used by `eval_non_incr` for the descent, where interior-node
+    /// payloads and proofs are never read. `proof` is left zeroed.
+    /// Note: the seed still goes through `convert` (plasma threads
+    /// `convert(seed).seed`, not the raw seed) — that step is irreducible.
+    fn eval_bit_seed_only(&self, state: &EvalState, dir: bool) -> EvalState {
+        let tau = state.seed.expand_dir(!dir, dir);
+        let mut seed = tau.seeds.get(dir).clone();
+        let mut new_bit = *tau.bits.get(dir);
+
+        if state.bit {
+            seed = &seed ^ &self.cor_words[state.level].seed;
+            new_bit ^= self.cor_words[state.level].bits.get(dir);
+        }
+
+        EvalState {
+            level: state.level + 1,
+            seed: seed.convert_seed_only(),
+            bit: new_bit,
+            proof: [0u8; XOF_SIZE],
+        }
+    }
+
+    /// Evaluate the full payload at a single node identified by `idx` (a
+    /// bit-path), descending **seed-only** (`eval_bit_seed_only` — no payload, no
+    /// proof) and computing the leaf with `gen_proof = false` (full embedding,
+    /// but no proof hash; the returned state is discarded). `idx` may be shorter
+    /// than the full domain (coresets sit at varying depths). Value-only read for
+    /// the post-traversal coreset embedding pass.
     pub fn eval_non_incr(&self, idx: &[bool]) -> T {
         debug_assert!(!idx.is_empty());
         debug_assert!(idx.len() <= self.domain_size());
         let mut state = self.eval_init();
-        let mut bit_str = String::new();
         for &b in idx.iter().take(idx.len() - 1) {
-            bit_str.push(if b { '1' } else { '0' });
-            let (next, _w) = self.eval_bit_no_aux(&state, b, &bit_str);
-            state = next;
+            state = self.eval_bit_seed_only(&state, b);
         }
-        bit_str.push(if *idx.last().unwrap() { '1' } else { '0' });
-        let (_st, word) = self.eval_bit(&state, *idx.last().unwrap(), &bit_str);
+        // `bit_str` is unused when `gen_proof = false`; aux=true to evaluate full payload.
+        // The leaf word doesn't depend on bit_str. Empty string avoids a per-call allocation.
+        let (_st, word) = self.eval_bit_inner(&state, *idx.last().unwrap(), &String::new(), true, false);
         word
     }
 

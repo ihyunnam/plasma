@@ -141,7 +141,7 @@ impl crate::prg::FromRng for (EmbCnt, FE) {
         // before the embedding. (gen and eval both route through this single
         // `from_rng`, so the layout stays internally consistent.)
         self.0.count = fe_sample(rng);
-        self.1 = fe_sample(rng);
+        self.1 = fe_sample(rng); // MAC (exists only for count)
         if self.0.embedding.len() != DIM {
             self.0.embedding = vec![0u32; DIM];
         }

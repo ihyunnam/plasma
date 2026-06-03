@@ -36,7 +36,7 @@ serde_json = "1.0"
 tarpc = { version = "0.30.0", features = ["full", "serde-transport", "tcp", "tokio1"]  }
 tokio = { version = "1.0", features = ["full", "macros"] }
 zipf = "7.0.0"
-counttree = { git = "https://github.com/ihyunnam/heavyhitters.git", rev = "565a544c150048b63ebea48c6711a210be911bdd" }
+counttree = { git = "https://github.com/ihyunnam/heavyhitters.git", rev = "9a3b24de72d75b1bb2ef7835fc44cc760fbc1eb4" }
 
 
 #[[bin]]

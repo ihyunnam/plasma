@@ -140,6 +140,21 @@ impl PrgSeed {
         out
     }
 
+    /// Derive only the next-level seed (the first PRG block) — no payload word at
+    /// all. Bit-identical to `convert`/`convert_no_aux`'s `.seed`, so it threads
+    /// the same `convert(seed).seed` plasma walks the tree on. Used by the
+    /// seed-only descent in `DPFKey::eval_non_incr`, which needs neither the
+    /// payload nor the proof at interior nodes.
+    pub fn convert_seed_only(self: &PrgSeed) -> PrgSeed {
+        let mut seed = PrgSeed::zero();
+        FIXED_KEY_STREAM.with(|s_in| {
+            let mut s = s_in.borrow_mut();
+            s.set_key(&self.key);
+            s.fill_bytes(&mut seed.key);
+        });
+        seed
+    }
+
     pub fn zero() -> PrgSeed {
         PrgSeed {
             key: [0; AES_KEY_SIZE],

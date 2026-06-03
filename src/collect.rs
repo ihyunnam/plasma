@@ -181,7 +181,7 @@ impl GlimpseKeyCollection {
             .unzip();
 
         // Node value is count-only (empty embedding); thresholding reads `.count`,
-        // the sketch reads `key_values[..].0.count` and `.1`.
+        // the sketch reads `key_values[..].0.count` and `.1` (MAC of `count`)
         let mut child_val = EmbCnt { count: FE::new(0), embedding: Vec::new() };
         for (i, v) in key_values.iter().enumerate() {
             if self.keys[i].0 {
@@ -227,7 +227,7 @@ impl GlimpseKeyCollection {
                     }
                 }
             }
-            self.frontier = self.recompute_prev_frontier();
+            self.frontier = self.recompute_prev_frontier(); // Recompute parents on-demand for recrawl (expected rare, save RAM)
         }
         // ct.mark(&format!("setup (split_by={split_by}, is_last={is_last}, mal={}, frontier_in={frontier_in})", malicious.len()));
 
@@ -253,7 +253,7 @@ impl GlimpseKeyCollection {
                 // Combine the multiple proofs that each client has for each prefix into a single
                 // proof for _each client_.
                 let mut proof = [0u8; XOF_SIZE];
-                next_frontier.iter().for_each(|node| {
+                next_frontier.iter().for_each(|node| {  // key_states contains proof which is unaffected by payload (so not evaluating embedding ok)
                     xor_in_place(&mut proof, &node.key_states[client_index].proof);
                 });
                 proof
@@ -303,7 +303,7 @@ impl GlimpseKeyCollection {
 
         self.frontier = next_frontier;
 
-        // Summed evaluations (full EmbCnt) for different 'child' prefixes
+        // Summed evaluations (just count, empty embedding) for different 'child' prefixes
         let out = self.frontier
             .par_iter()
             .map(|node| node.value.clone())
