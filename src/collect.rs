@@ -455,6 +455,22 @@ impl GlimpseKeyCollection {
             .collect()
     }
 
+    /// Free the per-level frontier (last level's `GlimpseTreeNode`s, each holding
+    /// `key_states` + `key_values` of length `n_keys` — multi-GB). Safe to call
+    /// after the traversal loop: the end-pass embedding eval reads only `self.keys`
+    /// via `eval_non_incr`, never the frontier.
+    pub fn clear_frontier(&mut self) {
+        self.frontier = Vec::new();
+    }
+
+    /// Free each key's MPC `triples` (consumed only by the per-level sketch verify,
+    /// dead after the last level). The end pass never touches them.
+    pub fn drop_triples(&mut self) {
+        for k in self.keys.iter_mut() {
+            k.1.triples = Vec::new();
+        }
+    }
+
     /// Local embedding shares for each coreset, identified by its node bit-path.
     /// For each path, sums every **alive** key's embedding payload at that node
     /// (seed-only descent, 768-wide expansion only at the leaf). Returned in the
