@@ -397,7 +397,7 @@ fn fe_from_rng(rng: &mut impl rand::Rng) -> FE {
 pub struct SketchDPFKey {
     pub mac_key: FE,
     pub mac_key2: FE,
-    key: DPFKey<(EmbCnt, FE)>, // the payload is (x, κ·count_x); MAC half is FE-only
+    pub key: DPFKey<(EmbCnt, FE)>, // the payload is (x, κ·count_x); MAC half is FE-only
     pub triples: Vec<TripleShare<FE>>,
 }
 
